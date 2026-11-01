@@ -60,6 +60,10 @@ def check_cve(package_name, package_version, cve_search_url):
     """
     try:
         query = f"{package_name} {package_version}"
+        # Name and version are pasted into the URL unquoted. A version with a
+        # plus sign or a name with a space changes the request path itself,
+        # and the failure that follows is logged as an API error, not as a
+        # malformed query built here.
         url = f"{cve_search_url}{query}"
         logging.info(f"Querying cve-search API: {url}")
         response = requests.get(url)
@@ -73,6 +77,10 @@ def check_cve(package_name, package_version, cve_search_url):
         else:
             logging.info(f"No CVEs found for {package_name} {package_version}")
 
+        # An empty list means four things at once in this design: no CVEs,
+        # the service errored, the JSON did not parse, or something else
+        # raised. main omits the package from the report in every case, so a
+        # failed lookup and a clean package produce identical output.
         return cves
     except requests.exceptions.RequestException as e:
         logging.error(f"Error querying cve-search API: {e}")
@@ -98,6 +106,9 @@ def run_nikto_scan(target_url):
   import subprocess
   try:
     logging.info(f"Running Nikto scan against {target_url}")
+    # Neither external scan sets a timeout. A target that drip feeds a
+    # response can hold this run open indefinitely, long after the CVE
+    # half finished and before any report is written.
     process = subprocess.run(['nikto', '-host', target_url], capture_output=True, text=True, check=True)
     return process.stdout
   except subprocess.CalledProcessError as e:
@@ -189,6 +200,9 @@ def main():
 
 
     try:
+        # A write failure here is logged and the process still exits 0, and
+        # the same silence applies to the per package failures above. Only a
+        # bad input file produces a nonzero exit in this tool.
         with open(args.output, 'w') as outfile:
             json.dump(vulnerability_report, outfile, indent=4)
         logging.info(f"Vulnerability report saved to {args.output}")
