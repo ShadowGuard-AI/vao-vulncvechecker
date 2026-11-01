@@ -1,5 +1,5 @@
 # vao-VulnCVEChecker
-Takes a list of software packages and their versions as input and checks for known CVEs affecting them. Utilizes the `cve-search` library or a direct API call to a CVE database and outputs a report of identified vulnerabilities. - Focused on Automates the execution and aggregation of results from multiple open-source vulnerability scanners (e.g., Nikto, Nmap NSE scripts for specific vulnerabilities). Orchestrates scans, parses reports, and correlates findings to provide a consolidated vulnerability overview.
+Takes a list of software packages and their versions as input and checks for known CVEs affecting them, using a direct API call to the cve-search API and verifying each returned entry against the queried product and version before attributing it. It can also run a default Nikto scan and an Nmap scan with -sV service version detection only (no NSE vulnerability scripts), and writes a consolidated JSON report. Scanner output and scanner failure are recorded in separate report fields.
 
 ## Install
 `git clone https://github.com/ShadowStrikeHQ/vao-vulncvechecker`

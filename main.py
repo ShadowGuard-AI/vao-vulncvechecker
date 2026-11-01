@@ -2,8 +2,8 @@ import argparse
 import logging
 import json
 import requests
-from bs4 import BeautifulSoup
 import sys
+from urllib.parse import quote
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,51 +46,80 @@ def validate_package_data(package_data):
             return False
     return True
 
-def check_cve(package_name, package_version, cve_search_url):
-    """
-    Checks for CVEs affecting a specific software package and version using the cve-search API.
-
-    Args:
-        package_name (str): The name of the software package.
-        package_version (str): The version of the software package.
-        cve_search_url (str): The base URL of the cve-search API.
-
-    Returns:
-        list: A list of CVEs affecting the package, or an empty list if no CVEs are found or an error occurs.
-    """
-    try:
-        query = f"{package_name} {package_version}"
-        # Name and version are pasted into the URL unquoted. A version with a
-        # plus sign or a name with a space changes the request path itself,
-        # and the failure that follows is logged as an API error, not as a
-        # malformed query built here.
-        url = f"{cve_search_url}{query}"
-        logging.info(f"Querying cve-search API: {url}")
-        response = requests.get(url)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
-        results = response.json()
-        cves = []
-        if results:
-            for result in results:
-                cves.append(result.get('id', 'N/A'))
+def _entry_matches(result, package_name, package_version):
+    """Verify a returned entry against the queried product and version."""
+    if not isinstance(result, dict):
+        return False
+    wanted_product = str(package_name).lower()
+    wanted_version = str(package_version)
+    products = []
+    if result.get('product'):
+        products.append((str(result['product']).lower(), str(result.get('version', ''))))
+    for p in result.get('products', []) or []:
+        if isinstance(p, dict):
+            products.append((str(p.get('product', '')).lower(), str(p.get('version', ''))))
         else:
-            logging.info(f"No CVEs found for {package_name} {package_version}")
+            products.append((str(p).lower(), ''))
+    for field in ('vulnerable_configuration', 'vulnerable_configurations', 'configurations', 'cpes'):
+        vals = result.get(field) or []
+        if isinstance(vals, str):
+            vals = [vals]
+        for v in vals:
+            text = v if isinstance(v, str) else json.dumps(v)
+            for token in text.replace('\\', '').split(':'):
+                pass
+            # CPE form cpe:2.3:a:vendor:product:version:... or cpe:/a:vendor:product:version
+            parts = text.split(':')
+            if len(parts) >= 6 and parts[0].endswith('cpe'):
+                products.append((parts[4].lower(), parts[5]))
+            elif text.lower().startswith('cpe:/') and len(parts) >= 4:
+                pp = text[5:].split(':')
+                if len(pp) >= 4:
+                    products.append((pp[2].lower(), pp[3]))
+    for prod, ver in products:
+        if prod != wanted_product:
+            continue
+        if not ver or ver in ('*', '-'):
+            return True
+        if ver == wanted_version:
+            return True
+    return False
 
-        # An empty list means four things at once in this design: no CVEs,
-        # the service errored, the JSON did not parse, or something else
-        # raised. main omits the package from the report in every case, so a
-        # failed lookup and a clean package produce identical output.
-        return cves
+
+def check_cve(package_name, package_version, cve_search_url):
+    """Returns (cves, error). error is None on a completed query."""
+    try:
+        # cve-search API search form: /api/search/<vendor>/<product>; here the
+        # package name and version are separately URL-encoded path/query parts.
+        base = cve_search_url.rstrip('/') + '/'
+        url = f"{base}{quote(str(package_name), safe='')}/{quote(str(package_version), safe='')}"
+        logging.info(f"Querying cve-search API: {url}")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        results = response.json()
+        if isinstance(results, dict):
+            results = results.get('results') or results.get('data') or []
+        cves = []
+        for result in results or []:
+            if _entry_matches(result, package_name, package_version):
+                cves.append(result.get('id', 'N/A'))
+            else:
+                logging.info(f"Skipping returned entry {result.get('id') if isinstance(result, dict) else result} that does not match {package_name} {package_version}")
+        if not results:
+            logging.info(f"No CVEs found for {package_name} {package_version}")
+        return cves, None
+    except requests.exceptions.Timeout as e:
+        logging.error(f"Timeout querying cve-search API for {package_name}: {e}")
+        return [], f"timeout: {e}"
     except requests.exceptions.RequestException as e:
         logging.error(f"Error querying cve-search API: {e}")
-        return []
+        return [], str(e)
     except json.JSONDecodeError as e:
         logging.error(f"Error decoding JSON response from cve-search API: {e}")
-        return []
+        return [], str(e)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-        return []
+        return [], str(e)
 
 def run_nikto_scan(target_url):
   """
@@ -104,12 +133,12 @@ def run_nikto_scan(target_url):
       str: The output of the Nikto scan, or None if an error occurred.
   """
   import subprocess
+  if str(target_url).startswith('-'):
+    logging.error("Refusing Nikto target that begins with a dash; it would be parsed as scanner flags.")
+    return None
   try:
     logging.info(f"Running Nikto scan against {target_url}")
-    # Neither external scan sets a timeout. A target that drip feeds a
-    # response can hold this run open indefinitely, long after the CVE
-    # half finished and before any report is written.
-    process = subprocess.run(['nikto', '-host', target_url], capture_output=True, text=True, check=True)
+    process = subprocess.run(['nikto', '-host', '--', target_url], capture_output=True, text=True, check=True)
     return process.stdout
   except subprocess.CalledProcessError as e:
     logging.error(f"Nikto scan failed: {e}")
@@ -133,9 +162,12 @@ def run_nmap_scan(target):
         str: The XML output of the Nmap scan, or None if an error occurred.
     """
     import subprocess
+    if str(target).startswith('-'):
+        logging.error("Refusing Nmap target that begins with a dash; it would be parsed as scanner flags.")
+        return None
     try:
         logging.info(f"Running Nmap scan against {target}")
-        process = subprocess.run(['nmap', '-sV', '-oX', '-', target], capture_output=True, text=True, check=True)  # -oX - output in XML format
+        process = subprocess.run(['nmap', '-sV', '-oX', '-', '--', target], capture_output=True, text=True, check=True)
         return process.stdout
     except subprocess.CalledProcessError as e:
         logging.error(f"Nmap scan failed: {e}")
@@ -175,42 +207,53 @@ def main():
     if not validate_package_data(package_data):
         sys.exit(1)
 
+    if not package_data:
+        logging.error("Package list is empty; nothing was checked.")
+        sys.exit(1)
+
     vulnerability_report = {}
+    failures = 0
     for package in package_data:
         package_name = package['name']
         package_version = package['version']
-        cves = check_cve(package_name, package_version, args.cve_search_url)
-        if cves:
-            vulnerability_report[f"{package_name} {package_version}"] = cves
+        cves, error = check_cve(package_name, package_version, args.cve_search_url)
+        key = f"{package_name} {package_version}"
+        if error is not None:
+            failures += 1
+            vulnerability_report[key] = {"error": error}
+        elif cves:
+            vulnerability_report[key] = cves
+        else:
+            vulnerability_report[key] = []
 
-    # Offensive tool integration starts here
     if args.nikto_scan:
         nikto_output = run_nikto_scan(args.nikto_scan)
         if nikto_output:
             vulnerability_report['nikto_scan'] = nikto_output
         else:
-          vulnerability_report['nikto_scan'] = "Nikto Scan Failed or not Run"
+          vulnerability_report['nikto_scan_error'] = "Nikto scan failed or not run"
 
     if args.nmap_target:
         nmap_output = run_nmap_scan(args.nmap_target)
         if nmap_output:
             vulnerability_report['nmap_scan'] = nmap_output
         else:
-            vulnerability_report['nmap_scan'] = "Nmap Scan Failed or not Run"
-
+            vulnerability_report['nmap_scan_error'] = "Nmap scan failed or not run"
 
     try:
-        # A write failure here is logged and the process still exits 0, and
-        # the same silence applies to the per package failures above. Only a
-        # bad input file produces a nonzero exit in this tool.
         with open(args.output, 'w') as outfile:
             json.dump(vulnerability_report, outfile, indent=4)
         logging.info(f"Vulnerability report saved to {args.output}")
-
     except IOError as e:
         logging.error(f"Error writing to file: {e}")
+        sys.exit(1)
     except Exception as e:
         logging.error(f"An unexpected error occurred while writing the report: {e}")
+        sys.exit(1)
+
+    if package_data and failures == len(package_data):
+        logging.error("Every CVE query failed; the run did not complete a check.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     # Usage Examples
