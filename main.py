@@ -44,7 +44,36 @@ def validate_package_data(package_data):
         if 'name' not in package or 'version' not in package:
             logging.error("Each package must have 'name' and 'version' keys.")
             return False
+        name = package['name']
+        version = package['version']
+        if not isinstance(name, str) or not name.strip():
+            logging.error("Each package 'name' must be a non-empty string.")
+            return False
+        if isinstance(version, bool) or not isinstance(version, (str, int, float)) or not str(version).strip():
+            logging.error("Each package 'version' must be a non-empty string or number.")
+            return False
     return True
+
+
+def _versions_equal(a, b):
+    """Compare two version strings.
+
+    Dotted numeric versions compare with trailing zero segments dropped,
+    so 2.31 matches 2.31.0. Anything else falls back to exact string
+    equality.
+    """
+    sa, sb = str(a).strip(), str(b).strip()
+    if sa == sb:
+        return True
+    def norm(s):
+        parts = s.split('.')
+        if not all(p.isdigit() for p in parts):
+            return None
+        while len(parts) > 1 and parts[-1] == '0':
+            parts.pop()
+        return parts
+    na, nb = norm(sa), norm(sb)
+    return na is not None and na == nb
 
 def _entry_matches(result, package_name, package_version):
     """Verify a returned entry against the queried product and version."""
@@ -66,8 +95,6 @@ def _entry_matches(result, package_name, package_version):
             vals = [vals]
         for v in vals:
             text = v if isinstance(v, str) else json.dumps(v)
-            for token in text.replace('\\', '').split(':'):
-                pass
             # CPE form cpe:2.3:a:vendor:product:version:... or cpe:/a:vendor:product:version
             parts = text.split(':')
             if len(parts) >= 6 and parts[0].endswith('cpe'):
@@ -81,7 +108,7 @@ def _entry_matches(result, package_name, package_version):
             continue
         if not ver or ver in ('*', '-'):
             return True
-        if ver == wanted_version:
+        if _versions_equal(ver, wanted_version):
             return True
     return False
 
@@ -188,6 +215,11 @@ def main():
 
     if not args.packages:
         logging.error("Please provide a JSON file containing software packages using the -p or --packages argument.")
+        sys.exit(1)
+
+    from pathlib import Path as _Path
+    if _Path(args.output).resolve() == _Path(args.packages).resolve():
+        logging.error(f"Output file {args.output} resolves to the input packages file; refusing to overwrite it.")
         sys.exit(1)
 
     try:
